@@ -105,3 +105,7 @@ Copy `.plan-code-scripts/`:
 
 - `--sandbox danger-full-access --approval never` is intentionally high-trust. Only use it in environments you control.
 - Don’t include secrets in agent briefs or planning artifacts; assume run directories may contain logs.
+
+## License
+
+MIT — see `LICENSE`.
