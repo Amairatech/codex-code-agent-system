@@ -1,0 +1,726 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import secrets
+import subprocess
+import sys
+import time
+import tomllib
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class Task:
+    task_id: str
+    title: str
+    description: str
+    expected_files: list[str]
+    verify: list[str]
+    done_criteria: list[str]
+    depends_on: list[str]
+    status: str = "pending"
+
+
+def _utc_now_rfc3339() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _new_invocation_run_id() -> str:
+    # Must be unique per orchestrator invocation even if `--reuse-run` reuses
+    # the same run directory. This prevents stale `results/<task_id>.json`
+    # from a prior invocation being treated as completion.
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{stamp}-{os.getpid()}-{secrets.token_hex(2)}"
+
+
+def _mkdirp(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _write_text(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+
+
+def _write_json(path: Path, data: Any) -> None:
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _sh_join(parts: list[str]) -> str:
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def _detect_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def _ghostty_open_command(args: list[str]) -> list[str]:
+    if not _detect_macos():
+        return ["ghostty", *args]
+    # On macOS, Ghostty expects an explicit action (e.g. `+new-window`).
+    # `open -na Ghostty.app --args` is the supported way to pass args.
+    return ["open", "-na", "Ghostty.app", "--args", "+new-window", *args]
+
+
+def _generate_default_plan(goal: str) -> list[Task]:
+    # Minimal starter plan (intended to be replaced/edited by the planner).
+    return [
+        Task(
+            task_id="task_001",
+            title="Implement the requested changes",
+            description=goal,
+            expected_files=[],
+            verify=[],
+            done_criteria=["Requested change is implemented and verified."],
+            depends_on=[],
+            status="pending",
+        )
+    ]
+
+
+def _normalize_task(raw: dict[str, Any]) -> Task:
+    task_id = raw.get("id") or raw.get("task_id")
+    if not task_id:
+        raise ValueError("Task is missing id/task_id")
+    return Task(
+        task_id=str(task_id),
+        title=str(raw.get("title") or "").strip() or str(task_id),
+        description=str(raw.get("description") or "").strip(),
+        expected_files=list(raw.get("expected_files") or []),
+        verify=list(raw.get("verify") or []),
+        done_criteria=list(raw.get("done_criteria") or []),
+        depends_on=list(raw.get("depends_on") or []),
+        status=str(raw.get("status") or "pending"),
+    )
+
+
+def _load_plan_file(plan_file: Path, goal_fallback: str) -> tuple[str, list[Task], dict[str, Any]]:
+    if not plan_file.exists():
+        goal = goal_fallback
+        tasks = _generate_default_plan(goal)
+        payload: dict[str, Any] = {
+            "goal": goal,
+            "created_at": _utc_now_rfc3339(),
+            "tasks": [
+                {
+                    "id": t.task_id,
+                    "title": t.title,
+                    "description": t.description,
+                    "expected_files": t.expected_files,
+                    "verify": t.verify,
+                    "done_criteria": t.done_criteria,
+                    "depends_on": t.depends_on,
+                    "status": t.status,
+                }
+                for t in tasks
+            ],
+        }
+        _mkdirp(plan_file.parent)
+        _write_json(plan_file, payload)
+        return goal, tasks, payload
+
+    payload = json.loads(plan_file.read_text(encoding="utf-8"))
+    goal = str(payload.get("goal") or goal_fallback)
+    raw_tasks = payload.get("tasks") or []
+    tasks = [_normalize_task(t) for t in raw_tasks]
+    return goal, tasks, payload
+
+
+def _task_markdown(
+    goal: str,
+    task: Task,
+    run_dir: Path,
+    code_dir: Path,
+    *,
+    invocation_run_id: str,
+    handshake: str = "done-file",
+) -> str:
+    results_path = run_dir / "results" / f"{task.task_id}.json"
+    done_path = run_dir / "done" / f"{task.task_id}.done"
+
+    handshake_lines: list[str]
+    if handshake == "results-json":
+        handshake_lines = [
+            f"- Write a JSON summary to: `{results_path}`",
+            "- Include `task_id` (or `task`) matching the task id.",
+            f"- Include `run_id` matching: `{invocation_run_id}`",
+            "- If the results file already exists, overwrite it.",
+        ]
+    else:
+        handshake_lines = [
+            f"- Write a JSON summary to: `{results_path}`",
+            f"- Then create an empty done marker file: `{done_path}`",
+        ]
+
+    return f"""# {task.task_id}: {task.title}
+
+## Goal
+{goal}
+
+## Task
+{task.description}
+
+## Expected files to touch
+{os.linesep.join(f"- `{p}`" for p in task.expected_files)}
+
+## Verification
+{os.linesep.join(f"- `{cmd}`" for cmd in task.verify)}
+
+## Done criteria
+{os.linesep.join(f"- {c}" for c in task.done_criteria)}
+
+## Orchestrator handshake (required)
+{os.linesep.join(handshake_lines)}
+
+## Notes
+- Workspace root: `{code_dir}`
+- You have write access to `{code_dir}` and `{run_dir}`.
+- Orchestrator invocation run id: `{invocation_run_id}`
+"""
+
+
+def _codex_prompt_for_task(
+    task: Task,
+    run_dir: Path,
+    *,
+    invocation_run_id: str,
+    handshake: str = "done-file",
+) -> str:
+    task_file = run_dir / "tasks" / f"{task.task_id}.md"
+    results_path = run_dir / "results" / f"{task.task_id}.json"
+    done_path = run_dir / "done" / f"{task.task_id}.done"
+    if handshake == "results-json":
+        return (
+            f"You are a code agent executing {task.task_id}.\n"
+            f"1) Read and follow the instructions in: {task_file}\n"
+            f"2) When finished, write a JSON summary to: {results_path}\n"
+            f"3) Include run_id={invocation_run_id}\n"
+            f"Do not skip steps 2-3."
+        )
+    return (
+        f"You are a code agent executing {task.task_id}.\n"
+        f"1) Read and follow the instructions in: {task_file}\n"
+        f"2) When finished, write a JSON summary to: {results_path}\n"
+        f"3) Then create the done marker file: {done_path}\n"
+        f"Do not skip steps 2-3."
+    )
+
+
+def _codex_command(
+    *,
+    interactive: bool,
+    sandbox: str,
+    approval: str,
+    code_dir: Path,
+    run_dir: Path,
+    prompt: str,
+) -> list[str]:
+    if interactive:
+        # For interactive runs, Codex CLI accepts these flags at top-level.
+        return [
+            "codex",
+            "-C",
+            str(code_dir),
+            "--sandbox",
+            sandbox,
+            "--ask-for-approval",
+            approval,
+            "--add-dir",
+            str(run_dir),
+            prompt,
+        ]
+
+    # For non-interactive runs, use `codex exec` and pass options after `exec`.
+    cmd = [
+        "codex",
+        "exec",
+        "-C",
+        str(code_dir),
+        "--add-dir",
+        str(run_dir),
+        "--skip-git-repo-check",
+    ]
+
+    # Codex CLI `exec` doesn't support the full approval matrix; `--full-auto`
+    # is the supported way to request sandboxed auto-execution.
+    if approval == "on-request" and sandbox == "workspace-write":
+        cmd.append("--full-auto")
+    elif approval == "never" and sandbox == "danger-full-access":
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        cmd += ["--sandbox", sandbox]
+
+    cmd.append(prompt)
+    return cmd
+
+
+def _load_orchestrator_config() -> dict[str, Any]:
+    cfg_path = os.environ.get("CODEX_ORCH_CONFIG")
+    if cfg_path:
+        path = Path(os.path.expanduser(os.path.expandvars(cfg_path)))
+    else:
+        codex_home = Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser()
+        path = codex_home / "orchestrator.toml"
+    if not path.exists():
+        return {}
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _run_git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=str(cwd), text=True, capture_output=True, check=False)
+
+
+def _ensure_gitignore_patterns(repo_dir: Path, patterns: list[str]) -> None:
+    path = repo_dir / ".gitignore"
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    existing_lines = {line.strip() for line in existing.splitlines()}
+    to_add = [p for p in patterns if p.strip() and p.strip() not in existing_lines]
+    if not to_add:
+        return
+    block = "\n".join(
+        ["", "# --- codex-orchestrator (auto) ---", *to_add, "# --- /codex-orchestrator ---", ""]
+    )
+    path.write_text(existing + block, encoding="utf-8")
+
+
+def _ensure_git_repo(code_dir: Path, *, gitignore_runs: bool) -> None:
+    in_repo = _run_git(code_dir, ["rev-parse", "--is-inside-work-tree"]).returncode == 0
+    if not in_repo:
+        init = _run_git(code_dir, ["init"])
+        if init.returncode != 0:
+            raise RuntimeError(f"git init failed: {init.stderr.strip()}")
+    if gitignore_runs:
+        _ensure_gitignore_patterns(code_dir, [".plans/**/runs/", ".plans/**/runs-*"])
+
+
+def _git_has_commits(code_dir: Path) -> bool:
+    return _run_git(code_dir, ["rev-parse", "--verify", "HEAD"]).returncode == 0
+
+
+def _maybe_baseline_commit(code_dir: Path) -> None:
+    # Create a baseline commit only if the repo has no commits yet.
+    if _git_has_commits(code_dir):
+        return
+    add = _run_git(code_dir, ["add", "-A"])
+    if add.returncode != 0:
+        print(f"warning: baseline git add failed: {add.stderr.strip()}")
+        return
+    commit = _run_git(code_dir, ["commit", "-m", "chore: baseline"])
+    if commit.returncode != 0:
+        out = f"{commit.stdout}\n{commit.stderr}".lower()
+        if "nothing to commit" in out:
+            return
+        print(f"warning: baseline commit failed: {commit.stderr.strip()}")
+
+
+def _checkout_git_branch(code_dir: Path, branch: str) -> None:
+    if not branch:
+        return
+    status = _run_git(code_dir, ["status", "--porcelain"])
+    dirty = bool(status.stdout.strip())
+    cmd = ["checkout", branch] if not dirty else ["checkout", "-m", branch]
+    res = _run_git(code_dir, cmd)
+    if res.returncode == 0:
+        return
+    res2 = _run_git(code_dir, ["checkout", "-b", branch])
+    if res2.returncode != 0:
+        print(f"warning: could not checkout branch {branch!r}: {res2.stderr.strip()}")
+
+
+def _launch_task_in_ghostty(
+    *,
+    task_id: str,
+    command: list[str],
+    run_dir: Path,
+    keep_open: bool,
+) -> None:
+    scripts_dir = run_dir / "logs"
+    _mkdirp(scripts_dir)
+    launcher = scripts_dir / f"launch_{task_id}.sh"
+
+    lines = [
+        "#!/bin/zsh",
+        "set -euo pipefail",
+        "",
+        "echo '--- codex-orchestrate: launching task in this window ---'",
+        _sh_join(command),
+    ]
+    if keep_open:
+        lines += [
+            "",
+            "echo ''",
+            "echo '--- task process exited; keeping window open ---'",
+            "echo 'Press any key to close this window.'",
+            "read -k 1",
+        ]
+
+    _write_text(launcher, "\n".join(lines) + "\n")
+    launcher.chmod(0o755)
+
+    ghostty_cmd = _ghostty_open_command(["-e", "/bin/zsh", "-lc", str(launcher)])
+    subprocess.run(ghostty_cmd, check=False)
+
+
+def _wait_for_done(done_file: Path, stop_file: Path) -> bool:
+    while True:
+        if stop_file.exists():
+            return False
+        if done_file.exists():
+            return True
+        time.sleep(0.5)
+
+
+def _task_json_is_done(path: Path, *, expected_task_id: str, expected_run_id: str) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    task_id = str(payload.get("task_id") or payload.get("task") or payload.get("id") or "")
+    if task_id != expected_task_id:
+        return False
+    run_id = str(payload.get("run_id") or "")
+    if run_id != expected_run_id:
+        return False
+    status = str(payload.get("status") or payload.get("state") or "").lower()
+    if status in ("completed", "complete", "done", "success"):
+        return True
+    # If agent omitted status, treat a valid matching json file as completion.
+    return True
+
+
+def _wait_for_task_completion(
+    *,
+    handshake: str,
+    expected_task_id: str,
+    expected_run_id: str,
+    results_file: Path,
+    done_file: Path,
+    stop_file: Path,
+) -> bool:
+    if handshake == "done-file":
+        return _wait_for_done(done_file, stop_file)
+    while True:
+        if stop_file.exists():
+            return False
+        if results_file.exists() and _task_json_is_done(
+            results_file, expected_task_id=expected_task_id, expected_run_id=expected_run_id
+        ):
+            return True
+        time.sleep(0.5)
+
+
+def main() -> int:
+    cfg = _load_orchestrator_config()
+    parser = argparse.ArgumentParser(description="Spawn Codex code agents to execute a small plan.")
+    parser.add_argument("--interactive-code", action="store_true", help="Use interactive `codex`.")
+    parser.add_argument("--ghostty", action="store_true", help="Open each task in a new Ghostty window.")
+    parser.add_argument("--keep-open", action="store_true", help="Keep Ghostty window open after exit.")
+    parser.add_argument("--no-wait", action="store_true", help="Spawn tasks and exit without waiting.")
+    parser.add_argument("--max-tasks", type=int, default=1, help="Max tasks to run this invocation (default: 1).")
+    parser.add_argument("--task-id", default=None, help="Run a specific task id (e.g. task_003).")
+    parser.add_argument(
+        "--handshake",
+        default=None,
+        choices=["done-file", "results-json"],
+        help="How completion is detected (default: done-file; compact-run prefers results-json).",
+    )
+    parser.add_argument(
+        "--compact-run",
+        action=argparse.BooleanOptionalAction,
+        default=bool(cfg.get("compact_run", False)),
+        help="Use a compact run directory layout (fewer subfolders; no plan snapshot; default can be set globally).",
+    )
+    parser.add_argument(
+        "--plan-file",
+        default=None,
+        help="Path to a plan JSON file (defaults to <plan-dir>/plan.json).",
+    )
+    parser.add_argument("--plan-dir", required=True, help="Directory where planning context lives.")
+    parser.add_argument("--code-dir", required=True, help="Directory where code changes should be made.")
+    parser.add_argument(
+        "--run-root",
+        default=cfg.get("run_root"),
+        help="Root directory to store run artifacts (e.g. ~/.codex/runs). Defaults to <plan-dir>/runs.",
+    )
+    parser.add_argument(
+        "--reuse-run",
+        action=argparse.BooleanOptionalAction,
+        default=bool(cfg.get("reuse_run", False)),
+        help="Reuse the most recent run directory instead of creating a new one.",
+    )
+    parser.add_argument(
+        "--ensure-git",
+        action=argparse.BooleanOptionalAction,
+        default=bool(cfg.get("ensure_git", False)),
+        help="If code-dir is not a git repo, initialize local git and add ignore rules for run artifacts.",
+    )
+    parser.add_argument(
+        "--baseline-commit",
+        action=argparse.BooleanOptionalAction,
+        default=bool(cfg.get("baseline_commit", False)),
+        help="If ensure-git and repo has no commits, create a baseline commit before task work.",
+    )
+    parser.add_argument(
+        "--git-branch",
+        default=cfg.get("git_branch"),
+        help="Best-effort checkout/create branch before running tasks (supports '<PR_NAME>' placeholder).",
+    )
+    parser.add_argument(
+        "--gitignore-runs",
+        action=argparse.BooleanOptionalAction,
+        default=bool(cfg.get("gitignore_runs", True)),
+        help="When ensure-git, add .gitignore patterns to ignore run artifacts.",
+    )
+    parser.add_argument(
+        "--stream-agent-output",
+        action=argparse.BooleanOptionalAction,
+        default=bool(cfg.get("stream_agent_output", False)),
+        help="Stream spawned Codex output to this terminal (default: capture to a log file to avoid planner context pollution).",
+    )
+    parser.add_argument(
+        "--sandbox",
+        default="workspace-write",
+        choices=["read-only", "workspace-write", "danger-full-access"],
+        help="Sandbox mode for spawned Codex sessions.",
+    )
+    parser.add_argument(
+        "--approval",
+        default="never",
+        choices=["untrusted", "on-failure", "on-request", "never"],
+        help="Approval policy for spawned Codex sessions.",
+    )
+    parser.add_argument("--run-dir", default=None, help="Override run directory.")
+    parser.add_argument("goal", nargs=argparse.REMAINDER, help="Goal string after `--`.")
+    args = parser.parse_args()
+
+    plan_dir = Path(args.plan_dir).expanduser().resolve()
+    code_dir = Path(args.code_dir).expanduser().resolve()
+    plan_file = Path(args.plan_file).expanduser().resolve() if args.plan_file else (plan_dir / "plan.json")
+
+    pr_name = plan_dir.name
+    if args.ensure_git:
+        try:
+            _ensure_git_repo(code_dir, gitignore_runs=bool(args.gitignore_runs))
+            if bool(args.baseline_commit):
+                _maybe_baseline_commit(code_dir)
+        except Exception as e:
+            print(f"warning: ensure-git failed: {e}")
+
+    if args.git_branch:
+        branch = str(args.git_branch).replace("<PR_NAME>", pr_name)
+        _checkout_git_branch(code_dir, branch)
+
+    goal = " ".join(args.goal).strip()
+    if not goal and not plan_file.exists():
+        parser.error("Missing GOAL. Use `-- \"your goal here\"` (or run with an existing plan.json).")
+
+    handshake = args.handshake or ("results-json" if args.compact_run else "done-file")
+
+    if args.run_dir:
+        run_dir = Path(args.run_dir).expanduser().resolve()
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        if args.run_root:
+            run_root = Path(str(args.run_root)).expanduser().resolve()
+            pr_runs_root = run_root / pr_name
+        else:
+            pr_runs_root = plan_dir / "runs"
+        _mkdirp(pr_runs_root)
+        if args.reuse_run:
+            existing = sorted([p for p in pr_runs_root.glob("*") if p.is_dir()])
+            run_dir = existing[-1] if existing else (pr_runs_root / f"{stamp}-{os.getpid()}")
+        else:
+            run_dir = pr_runs_root / f"{stamp}-{os.getpid()}"
+
+    invocation_run_id = _new_invocation_run_id()
+
+    tasks_dir = run_dir / "tasks"
+    results_dir = run_dir / "results"
+    done_dir = run_dir / "done"
+    control_dir = run_dir / "control"
+    logs_dir = run_dir / "logs"
+
+    _mkdirp(tasks_dir)
+    _mkdirp(results_dir)
+    _mkdirp(control_dir)
+    if handshake == "done-file":
+        _mkdirp(done_dir)
+    if args.ghostty:
+        _mkdirp(logs_dir)
+
+    stop_file = control_dir / "stop"
+
+    plan_goal, tasks, plan_payload = _load_plan_file(plan_file, goal)
+    # Snapshot the plan into the run for auditability/debugging (default off in compact mode).
+    if not args.compact_run:
+        run_plan_path = run_dir / "plan" / "plan.json"
+        _mkdirp(run_plan_path.parent)
+        _write_json(
+            run_plan_path,
+            {**plan_payload, "plan_dir": str(plan_dir), "code_dir": str(code_dir), "run_dir": str(run_dir)},
+        )
+    _write_json(
+        run_dir / "meta.json",
+        {"run_dir": str(run_dir), "invocation_run_id": invocation_run_id, "args": vars(args), "created_at": _utc_now_rfc3339()},
+    )
+
+    print(f"RUN_DIR={run_dir}")
+    print(f"PLAN_FILE={plan_file}")
+    if not args.compact_run:
+        print(f"RUN_PLAN={run_dir / 'plan' / 'plan.json'}")
+
+    def deps_satisfied(t: Task, by_id: dict[str, Task]) -> bool:
+        for dep in t.depends_on:
+            dep_task = by_id.get(dep)
+            if not dep_task or dep_task.status != "done":
+                return False
+        return True
+
+    by_id = {t.task_id: t for t in tasks}
+    runnable: list[Task] = []
+    if args.task_id:
+        t = by_id.get(args.task_id)
+        if not t:
+            print(f"Task {args.task_id!r} not found in {plan_file}")
+            return 2
+        runnable = [t]
+    else:
+        for t in sorted(tasks, key=lambda x: x.task_id):
+            # Only run tasks that are explicitly pending. The planner is the
+            # source of truth for promoting tasks to "done" after verification.
+            # Treat delegated/agent_done as non-runnable to avoid accidental reruns.
+            if t.status != "pending":
+                continue
+            if not deps_satisfied(t, by_id):
+                continue
+            runnable.append(t)
+
+    if not runnable:
+        print("No runnable tasks found (all done/blocked, or deps unsatisfied).")
+        return 0
+
+    ran = 0
+    plan_payload_updated = False
+    for task in runnable:
+        if ran >= max(1, args.max_tasks):
+            break
+        if stop_file.exists():
+            print("Stop signal detected; not launching further tasks.")
+            return 2
+
+        # Update status in the shared plan file so the planner can see delegation state.
+        if task.status == "pending":
+            for raw in plan_payload.get("tasks", []):
+                if (raw.get("id") or raw.get("task_id")) == task.task_id:
+                    raw["status"] = "delegated"
+                    raw["delegated_at"] = _utc_now_rfc3339()
+                    raw["run_dir"] = str(run_dir)
+                    plan_payload_updated = True
+                    break
+
+        task_file = tasks_dir / f"{task.task_id}.md"
+        _write_text(
+            task_file,
+            _task_markdown(
+                plan_goal,
+                task,
+                run_dir,
+                code_dir,
+                handshake=handshake,
+                invocation_run_id=invocation_run_id,
+            ),
+        )
+
+        done_file = done_dir / f"{task.task_id}.done"
+        results_file = results_dir / f"{task.task_id}.json"
+
+        # If we reuse a run directory, move aside stale completion artifacts so
+        # the orchestrator can't immediately "complete" without an agent run.
+        if results_file.exists():
+            stale = results_dir / f"{task.task_id}.stale-{invocation_run_id}.json"
+            try:
+                results_file.rename(stale)
+            except OSError:
+                pass
+        if handshake == "done-file" and done_file.exists():
+            stale_done = done_dir / f"{task.task_id}.stale-{invocation_run_id}.done"
+            try:
+                done_file.rename(stale_done)
+            except OSError:
+                pass
+
+        codex_base = [
+            *_codex_command(
+                interactive=args.interactive_code,
+                sandbox=args.sandbox,
+                approval=args.approval,
+                code_dir=code_dir,
+                run_dir=run_dir,
+                prompt=_codex_prompt_for_task(task, run_dir, handshake=handshake, invocation_run_id=invocation_run_id),
+            )
+        ]
+        codex_cmd = codex_base
+
+        if args.ghostty:
+            _launch_task_in_ghostty(task_id=task.task_id, command=codex_cmd, run_dir=run_dir, keep_open=args.keep_open)
+        else:
+            if args.interactive_code:
+                # Interactive sessions require a TTY; always stream output.
+                proc = subprocess.run(codex_cmd, check=False)
+            elif args.stream_agent_output:
+                proc = subprocess.run(codex_cmd, check=False)
+            else:
+                log_path = run_dir / f"agent_{task.task_id}.log"
+                with log_path.open("ab") as log_fp:
+                    proc = subprocess.run(codex_cmd, check=False, stdout=log_fp, stderr=subprocess.STDOUT)
+            if proc.returncode != 0:
+                print(f"Task {task.task_id} failed to launch (exit={proc.returncode}).")
+                print("Hint: verify your Codex CLI version supports the flags in use.")
+                if not args.stream_agent_output and not args.interactive_code:
+                    print(f"Agent output captured at: {run_dir / f'agent_{task.task_id}.log'}")
+                return proc.returncode
+
+        ran += 1
+        if args.no_wait:
+            continue
+
+        wait_target = results_file if handshake == "results-json" else done_file
+        print(f"Waiting for {wait_target} ...")
+        if not _wait_for_task_completion(
+            handshake=handshake,
+            expected_task_id=task.task_id,
+            expected_run_id=invocation_run_id,
+            results_file=results_file,
+            done_file=done_file,
+            stop_file=stop_file,
+        ):
+            print("Stopped while waiting for task completion.")
+            return 2
+
+        # Mark agent completion (planner still decides when it's "done" after verification).
+        for raw in plan_payload.get("tasks", []):
+            if (raw.get("id") or raw.get("task_id")) == task.task_id:
+                if raw.get("status") == "delegated":
+                    raw["status"] = "agent_done"
+                    raw["agent_done_at"] = _utc_now_rfc3339()
+                    plan_payload_updated = True
+                break
+
+    if plan_payload_updated:
+        _write_json(plan_file, plan_payload)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
