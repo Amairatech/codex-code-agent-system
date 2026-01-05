@@ -99,7 +99,7 @@ Goal: offload repo discovery + external research + plan critique to separate too
 ### 1) Research agent (Codex)
 Run before drafting plan options:
 ```bash
-python3 .plan-code-scripts/preplan_research.py --pr "<PR_NAME>" --goal "<GOAL>"
+python3 .plan-code-scripts/preplan_research.py --pr "<PR_NAME>" --goal "<GOAL>" --timeout-minutes 45
 ```
 
 Expected outputs:
@@ -152,6 +152,18 @@ Repeat until all tasks are done:
 - Prefer a baseline commit if the repo has no git history (baseline snapshot on default branch, then feature work on `pr/<PR_NAME>`).
 - Use parallelism only across non-overlapping domains; otherwise run one task at a time.
 - Never run `killall`/`pkill` (especially against `codex`, `ghostty`, `Terminal`, or your shell). In YOLO mode this can kill every planner session across projects. If something hangs, kill only the exact PID you started, or stop via the orchestrator run’s `RUN_DIR` artifacts.
+
+## Helper scripts (planner ergonomics)
+
+Record manual verification (updates `.plans/<PR>/MASTER.md` + `.plans/<PR>/plan.json`):
+```bash
+python3 .plan-code-scripts/mark_verified.py --pr "<PR_NAME>" --task task_009 --note "device ok"
+```
+
+Sync plan state from run artifacts if plan.json drifted:
+```bash
+python3 .plan-code-scripts/sync_plan.py --pr "<PR_NAME>" --run-root "${CODEX_HOME:-$HOME/.codex}/runs"
+```
 
 ## Spawning Code Agents (Ghostty optional)
 

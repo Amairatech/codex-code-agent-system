@@ -43,6 +43,8 @@ class PreplanToolsTests(unittest.TestCase):
             self.assertEqual(payload["tasks"][0]["id"], "task_000")
             expected = ".plans/my-pr/research/RESEARCH.md"
             self.assertIn(expected, payload["tasks"][0]["expected_files"][0])
+            # Resilience: always writes a checkpoint RESEARCH.md even in dry-run mode.
+            self.assertTrue((repo / ".plans" / "my-pr" / "research" / "RESEARCH.md").exists())
 
     def test_gemini_dry_run_writes_review(self) -> None:
         with tempfile.TemporaryDirectory() as td:

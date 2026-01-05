@@ -54,6 +54,31 @@ class SpecflowTests(unittest.TestCase):
             context_path = repo / ".plans" / "my-pr" / "CONTEXT.md"
             self.assertTrue(context_path.exists())
 
+            # Validate-plan succeeds.
+            res = run_specflow("validate-plan", "--pr", "my-pr", repo=repo)
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_plan_applies_verify_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self.assertEqual(run_specflow("init", repo=repo).returncode, 0)
+            self.assertEqual(run_specflow("proposal", "x", repo=repo).returncode, 0)
+
+            overrides = repo / "verify_overrides.json"
+            overrides.write_text(
+                json.dumps(
+                    {
+                        "default_verify": ["echo default"],
+                        "by_task_id": {"task_001": {"verify": ["echo t1"]}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            res = run_specflow("plan", "x", "--pr", "p", "--verify-overrides", str(overrides), repo=repo)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            payload = json.loads((repo / ".plans" / "p" / "plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["tasks"][0]["verify"], ["echo t1"])
+
     def test_plan_refuses_overwrite_without_force(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)

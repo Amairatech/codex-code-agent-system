@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -50,6 +51,49 @@ def _write_text(path: Path, content: str) -> None:
 
 def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _tail_text(path: Path, *, max_lines: int = 200, max_bytes: int = 128_000) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if len(data) > max_bytes:
+        data = data[-max_bytes:]
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(lines[-max_lines:])
+
+
+def _write_fallback_results(
+    *,
+    results_path: Path,
+    task_id: str,
+    run_id: str,
+    status: str,
+    note: str,
+    exit_code: int | None,
+    log_path: Path | None,
+) -> None:
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "run_id": run_id,
+        "status": status,
+        "note": note,
+        "generated_by": "codex-orchestrate",
+        "generated_at": _utc_now_rfc3339(),
+    }
+    if exit_code is not None:
+        payload["exit_code"] = exit_code
+    if log_path is not None:
+        payload["log_path"] = str(log_path)
+        tail = _tail_text(log_path)
+        if tail.strip():
+            payload["log_tail"] = tail
+    _mkdirp(results_path.parent)
+    _write_json(results_path, payload)
 
 
 def _sh_join(parts: list[str]) -> str:
@@ -224,7 +268,8 @@ def _codex_command(
 ) -> list[str]:
     if interactive:
         # For interactive runs, Codex CLI accepts these flags at top-level.
-        return [
+        return (
+            [
             "codex",
             "-C",
             str(code_dir),
@@ -235,7 +280,9 @@ def _codex_command(
             "--add-dir",
             str(run_dir),
             prompt,
-        ]
+            ],
+            None,
+        )
 
     # For non-interactive runs, use `codex exec` and pass options after `exec`.
     cmd = [
@@ -257,8 +304,33 @@ def _codex_command(
     else:
         cmd += ["--sandbox", sandbox]
 
-    cmd.append(prompt)
-    return cmd
+    # Pass the prompt via stdin to avoid shell/arg parsing edge cases.
+    cmd.append("-")
+    return cmd, prompt + "\n"
+
+
+def _terminate_process_group(pid: int, *, grace_seconds: float = 4.0) -> None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            return
+    deadline = time.time() + grace_seconds
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except Exception:
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
 
 
 def _load_orchestrator_config() -> dict[str, Any]:
@@ -489,6 +561,18 @@ def main() -> int:
         help="Stream spawned Codex output to this terminal (default: capture to a log file to avoid planner context pollution).",
     )
     parser.add_argument(
+        "--timeout-minutes",
+        type=float,
+        default=float(cfg.get("timeout_minutes", 0) or 0),
+        help="Kill a stuck agent after this many minutes (0 = no timeout). Writes a fallback results JSON with status=partial.",
+    )
+    parser.add_argument(
+        "--timeout-grace-seconds",
+        type=float,
+        default=float(cfg.get("timeout_grace_seconds", 4.0) or 4.0),
+        help="Grace period before SIGKILL when timing out an agent process group.",
+    )
+    parser.add_argument(
         "--sandbox",
         default="workspace-write",
         choices=["read-only", "workspace-write", "danger-full-access"],
@@ -624,7 +708,7 @@ def main() -> int:
         if task.status == "pending":
             for raw in plan_payload.get("tasks", []):
                 if (raw.get("id") or raw.get("task_id")) == task.task_id:
-                    raw["status"] = "delegated"
+                    raw["status"] = "in_progress"
                     raw["delegated_at"] = _utc_now_rfc3339()
                     raw["run_dir"] = str(run_dir)
                     plan_payload_updated = True

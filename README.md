@@ -50,7 +50,7 @@ python3 .plan-code-scripts/specflow.py plan "${CHANGE}" --pr "<PR_NAME>"
 ### 2) Pre-plan research agent (Codex)
 
 ```bash
-python3 .plan-code-scripts/preplan_research.py --repo . --pr "<PR_NAME>" --goal "<GOAL>"
+python3 .plan-code-scripts/preplan_research.py --repo . --pr "<PR_NAME>" --goal "<GOAL>" --timeout-minutes 45
 ```
 
 Expected output:
@@ -91,6 +91,20 @@ Planner then:
 - verifies the changes with the task’s `verify` commands
 - marks the task `done` in `.plans/<PR_NAME>/plan.json`
 - commits with a `task_00X:`-style message
+
+### 6) Record verification + sync plan state (optional)
+
+If you verified something manually (device/simulator/etc.), record it in files:
+
+```bash
+python3 .plan-code-scripts/mark_verified.py --repo . --pr "<PR_NAME>" --task task_009 --note "device ok"
+```
+
+If your plan drifted (results exist in run folders but plan.json didn’t update), sync from run artifacts:
+
+```bash
+python3 .plan-code-scripts/sync_plan.py --repo . --pr "<PR_NAME>" --run-root "${CODEX_HOME:-$HOME/.codex}/runs"
+```
 
 ## What to copy into your repo
 

@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -50,6 +51,49 @@ def _write_text(path: Path, content: str) -> None:
 
 def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _tail_text(path: Path, *, max_lines: int = 200, max_bytes: int = 128_000) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if len(data) > max_bytes:
+        data = data[-max_bytes:]
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(lines[-max_lines:])
+
+
+def _write_fallback_results(
+    *,
+    results_path: Path,
+    task_id: str,
+    run_id: str,
+    status: str,
+    note: str,
+    exit_code: int | None,
+    log_path: Path | None,
+) -> None:
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "run_id": run_id,
+        "status": status,
+        "note": note,
+        "generated_by": "codex-orchestrate",
+        "generated_at": _utc_now_rfc3339(),
+    }
+    if exit_code is not None:
+        payload["exit_code"] = exit_code
+    if log_path is not None:
+        payload["log_path"] = str(log_path)
+        tail = _tail_text(log_path)
+        if tail.strip():
+            payload["log_tail"] = tail
+    _mkdirp(results_path.parent)
+    _write_json(results_path, payload)
 
 
 def _sh_join(parts: list[str]) -> str:
@@ -224,7 +268,8 @@ def _codex_command(
 ) -> list[str]:
     if interactive:
         # For interactive runs, Codex CLI accepts these flags at top-level.
-        return [
+        return (
+            [
             "codex",
             "-C",
             str(code_dir),
@@ -235,7 +280,9 @@ def _codex_command(
             "--add-dir",
             str(run_dir),
             prompt,
-        ]
+            ],
+            None,
+        )
 
     # For non-interactive runs, use `codex exec` and pass options after `exec`.
     cmd = [
@@ -257,8 +304,33 @@ def _codex_command(
     else:
         cmd += ["--sandbox", sandbox]
 
-    cmd.append(prompt)
-    return cmd
+    # Pass the prompt via stdin to avoid shell/arg parsing edge cases.
+    cmd.append("-")
+    return cmd, prompt + "\n"
+
+
+def _terminate_process_group(pid: int, *, grace_seconds: float = 4.0) -> None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            return
+    deadline = time.time() + grace_seconds
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except Exception:
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
 
 
 def _load_orchestrator_config() -> dict[str, Any]:
@@ -489,6 +561,18 @@ def main() -> int:
         help="Stream spawned Codex output to this terminal (default: capture to a log file to avoid planner context pollution).",
     )
     parser.add_argument(
+        "--timeout-minutes",
+        type=float,
+        default=float(cfg.get("timeout_minutes", 0) or 0),
+        help="Kill a stuck agent after this many minutes (0 = no timeout). Writes a fallback results JSON with status=partial.",
+    )
+    parser.add_argument(
+        "--timeout-grace-seconds",
+        type=float,
+        default=float(cfg.get("timeout_grace_seconds", 4.0) or 4.0),
+        help="Grace period before SIGKILL when timing out an agent process group.",
+    )
+    parser.add_argument(
         "--sandbox",
         default="workspace-write",
         choices=["read-only", "workspace-write", "danger-full-access"],
@@ -624,7 +708,7 @@ def main() -> int:
         if task.status == "pending":
             for raw in plan_payload.get("tasks", []):
                 if (raw.get("id") or raw.get("task_id")) == task.task_id:
-                    raw["status"] = "delegated"
+                    raw["status"] = "in_progress"
                     raw["delegated_at"] = _utc_now_rfc3339()
                     raw["run_dir"] = str(run_dir)
                     plan_payload_updated = True
@@ -661,27 +745,39 @@ def main() -> int:
             except OSError:
                 pass
 
-        codex_base = [
-            *_codex_command(
-                interactive=args.interactive_code,
-                sandbox=args.sandbox,
-                approval=args.approval,
-                code_dir=code_dir,
-                run_dir=run_dir,
-                prompt=_codex_prompt_for_task(task, run_dir, handshake=handshake, invocation_run_id=invocation_run_id),
-            )
-        ]
-        codex_cmd = codex_base
+        codex_cmd, codex_stdin = _codex_command(
+            interactive=args.interactive_code,
+            sandbox=args.sandbox,
+            approval=args.approval,
+            code_dir=code_dir,
+            run_dir=run_dir,
+            prompt=_codex_prompt_for_task(task, run_dir, handshake=handshake, invocation_run_id=invocation_run_id),
+        )
 
         if args.ghostty:
-            _launch_task_in_ghostty(task_id=task.task_id, command=codex_cmd, run_dir=run_dir, keep_open=args.keep_open)
+            # Ghostty launcher is shell-based; feed the prompt from a file to avoid arg/quoting issues.
+            prompt_path = tasks_dir / f"{task.task_id}.prompt.txt"
+            _write_text(prompt_path, codex_stdin or "")
+            # Replace trailing "-" with stdin file piping if using stdin prompts.
+            if codex_cmd and codex_cmd[-1] == "-" and codex_stdin is not None:
+                cmd_str = _sh_join(codex_cmd)
+                wrapped = ["/bin/zsh", "-lc", f"cat {shlex.quote(str(prompt_path))} | {cmd_str}"]
+                _launch_task_in_ghostty(task_id=task.task_id, command=wrapped, run_dir=run_dir, keep_open=args.keep_open)
+            else:
+                _launch_task_in_ghostty(task_id=task.task_id, command=codex_cmd, run_dir=run_dir, keep_open=args.keep_open)
         else:
             if args.interactive_code:
                 # Interactive sessions require a TTY; always stream output.
                 proc = subprocess.run(codex_cmd, check=False)
             elif args.stream_agent_output:
                 # When streaming, avoid attaching stdin so agents can't put the planner TTY into a weird state.
-                proc = subprocess.run(codex_cmd, check=False, stdin=subprocess.DEVNULL)
+                proc = subprocess.run(
+                    codex_cmd,
+                    check=False,
+                    input=codex_stdin,
+                    text=True,
+                    timeout=(None if args.timeout_minutes <= 0 else args.timeout_minutes * 60.0),
+                )
             else:
                 log_path = run_dir / f"agent_{task.task_id}.log"
                 # Fully detach the agent from the planner's TTY/session so a crash/kill doesn't
@@ -693,18 +789,58 @@ def main() -> int:
                         codex_cmd,
                         stdout=log_fp,
                         stderr=subprocess.STDOUT,
-                        stdin=subprocess.DEVNULL,
+                        stdin=subprocess.PIPE if codex_stdin is not None else subprocess.DEVNULL,
                         start_new_session=True,
                         env=env,
                     )
                     _write_json(agent_pids_path, {task.task_id: popen.pid})
-                    rc = popen.wait()
-                    proc = subprocess.CompletedProcess(codex_cmd, rc)
+                    try:
+                        if codex_stdin is not None:
+                            popen.stdin.write(codex_stdin.encode("utf-8", errors="replace"))
+                            popen.stdin.close()
+                        timeout = None if args.timeout_minutes <= 0 else args.timeout_minutes * 60.0
+                        rc = popen.wait(timeout=timeout)
+                        proc = subprocess.CompletedProcess(codex_cmd, rc)
+                    except subprocess.TimeoutExpired:
+                        _terminate_process_group(popen.pid, grace_seconds=float(args.timeout_grace_seconds))
+                        _write_fallback_results(
+                            results_path=results_file,
+                            task_id=task.task_id,
+                            run_id=invocation_run_id,
+                            status="partial",
+                            note="Agent timed out; process group terminated.",
+                            exit_code=None,
+                            log_path=log_path,
+                        )
+                        # Mark as blocked; planner can retry with a smaller task or longer timeout.
+                        for raw in plan_payload.get("tasks", []):
+                            if (raw.get("id") or raw.get("task_id")) == task.task_id:
+                                raw["status"] = "blocked"
+                                raw["blocked_reason"] = "timeout"
+                                raw["blocked_at"] = _utc_now_rfc3339()
+                                plan_payload_updated = True
+                                break
+                        if plan_payload_updated:
+                            _write_json(plan_file, plan_payload)
+                        print(f"Task {task.task_id} timed out; wrote fallback results to: {results_file}")
+                        return 124
             if proc.returncode != 0:
                 print(f"Task {task.task_id} failed to launch (exit={proc.returncode}).")
                 print("Hint: verify your Codex CLI version supports the flags in use.")
                 if not args.stream_agent_output and not args.interactive_code:
                     print(f"Agent output captured at: {run_dir / f'agent_{task.task_id}.log'}")
+                    # Ensure the planner has a results file to inspect.
+                    log_path = run_dir / f"agent_{task.task_id}.log"
+                    if handshake == "results-json" and not results_file.exists():
+                        _write_fallback_results(
+                            results_path=results_file,
+                            task_id=task.task_id,
+                            run_id=invocation_run_id,
+                            status="partial",
+                            note=f"Agent exited with code {proc.returncode} before writing results.",
+                            exit_code=proc.returncode,
+                            log_path=log_path if log_path.exists() else None,
+                        )
                 return proc.returncode
 
         ran += 1
@@ -725,12 +861,24 @@ def main() -> int:
             return 2
 
         # Mark agent completion (planner still decides when it's "done" after verification).
+        result_status = ""
+        try:
+            if results_file.exists():
+                result_status = str(json.loads(results_file.read_text(encoding="utf-8")).get("status") or "").lower()
+        except Exception:
+            result_status = ""
         for raw in plan_payload.get("tasks", []):
             if (raw.get("id") or raw.get("task_id")) == task.task_id:
-                if raw.get("status") == "delegated":
-                    raw["status"] = "agent_done"
-                    raw["agent_done_at"] = _utc_now_rfc3339()
+                if result_status in ("partial", "timeout", "failed"):
+                    raw["status"] = "blocked"
+                    raw["blocked_reason"] = "agent_reported_partial"
+                    raw["blocked_at"] = _utc_now_rfc3339()
                     plan_payload_updated = True
+                else:
+                    if raw.get("status") in ("in_progress", "delegated"):
+                        raw["status"] = "agent_done"
+                        raw["agent_done_at"] = _utc_now_rfc3339()
+                        plan_payload_updated = True
                 break
 
     if plan_payload_updated:

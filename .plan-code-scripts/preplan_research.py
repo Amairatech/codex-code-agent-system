@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import subprocess
+import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,37 @@ class ResearchPlanPaths:
 
 def _default_output_md(*, plan_dir: Path) -> Path:
     return plan_dir / "research" / "RESEARCH.md"
+
+
+def _write_checkpoint_md(*, out_md: Path, pr_name: str, goal: str, note: str) -> None:
+    _mkdirp(out_md.parent)
+    stamp = _utc_now_rfc3339()
+    header = f"# Research Brief ({_slugify(pr_name)})\n\n- generated_at: `{stamp}`\n- goal: {goal}\n\n"
+    body = textwrap.dedent(
+        f"""\
+        ## Status
+
+        {note}
+
+        ## Repo summary (fill)
+        - ...
+
+        ## External research (fill)
+        - ...
+
+        ## Risks / edge cases (fill)
+        - ...
+
+        ## Suggested verification commands (fill)
+        - ...
+        """
+    )
+    if out_md.exists():
+        existing = out_md.read_text(encoding="utf-8")
+        if existing.strip():
+            out_md.write_text(existing.rstrip() + f"\n\n---\n\n## Checkpoint ({stamp})\n\n{note}\n", encoding="utf-8")
+            return
+    out_md.write_text(header + body + "\n", encoding="utf-8")
 
 
 def create_research_plan(*, repo: Path, pr_name: str, goal: str, output_md: Path | None) -> ResearchPlanPaths:
@@ -112,9 +144,46 @@ def _detect_orchestrator() -> list[str]:
     return ["codex-orchestrate"]
 
 
-def _run(cmd: list[str], *, cwd: Path) -> int:
-    proc = subprocess.run(cmd, cwd=str(cwd), text=True, check=False)
-    return int(proc.returncode)
+def _parse_run_dir(output: str) -> Path | None:
+    for line in output.splitlines():
+        if line.startswith("RUN_DIR="):
+            return Path(line.removeprefix("RUN_DIR=").strip())
+    return None
+
+
+def _append_failure_details(*, out_md: Path, run_dir: Path | None) -> None:
+    stamp = _utc_now_rfc3339()
+    details: list[str] = []
+    if run_dir:
+        details.append(f"- run_dir: `{run_dir}`")
+        results = run_dir / "results" / "task_000.json"
+        log = run_dir / "agent_task_000.log"
+        if results.exists():
+            details.append(f"- results: `{results}`")
+            try:
+                payload = json.loads(results.read_text(encoding="utf-8"))
+                status = payload.get("status")
+                note = payload.get("note")
+                details.append(f"- orchestrator_results.status: `{status}`")
+                if note:
+                    details.append(f"- orchestrator_results.note: {note}")
+            except Exception:
+                pass
+        if log.exists():
+            details.append(f"- agent_log: `{log}`")
+    msg = "Research agent did not complete successfully; leaving checkpoints and pointers for manual follow-up."
+    _mkdirp(out_md.parent)
+    existing = out_md.read_text(encoding="utf-8") if out_md.exists() else ""
+    out_md.write_text(
+        existing.rstrip()
+        + f"\n\n---\n\n## Failure checkpoint ({stamp})\n\n{msg}\n\n"
+        + ("\n".join(details) + "\n" if details else ""),
+        encoding="utf-8",
+    )
+
+
+def _run(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True, check=False)
 
 
 def main() -> int:
@@ -130,6 +199,12 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Only write the preplan plan file; do not run Codex.")
     parser.add_argument("--ghostty", action="store_true", help="Run the research agent in a new Ghostty window.")
     parser.add_argument("--keep-open", action="store_true", help="Keep the Ghostty window open after exit.")
+    parser.add_argument(
+        "--timeout-minutes",
+        type=float,
+        default=45.0,
+        help="Timeout for the research agent run. Always writes a checkpoint RESEARCH.md (default: 45).",
+    )
     parser.add_argument(
         "--run-root",
         default=os.environ.get("CODEX_RUN_ROOT") or str(Path("~/.codex/runs").expanduser()),
@@ -152,6 +227,12 @@ def main() -> int:
     repo = Path(args.repo).resolve()
     out_md = Path(args.out).resolve() if args.out else None
     paths = create_research_plan(repo=repo, pr_name=args.pr, goal=args.goal, output_md=out_md)
+    _write_checkpoint_md(
+        out_md=paths.output_md,
+        pr_name=args.pr,
+        goal=args.goal,
+        note="Checkpoint created before launching research agent.",
+    )
 
     if args.dry_run:
         print(f"Wrote research plan file: {paths.plan_file}")
@@ -184,13 +265,20 @@ def main() -> int:
         "--max-tasks",
         "1",
     ]
+    if args.timeout_minutes and args.timeout_minutes > 0:
+        cmd += ["--timeout-minutes", str(float(args.timeout_minutes))]
     if args.ghostty:
         cmd += ["--ghostty"]
     if args.keep_open:
         cmd += ["--keep-open"]
     cmd += ["--", args.goal]
 
-    return _run(cmd, cwd=repo)
+    proc = _run(cmd, cwd=repo)
+    output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+    run_dir = _parse_run_dir(output)
+    if proc.returncode != 0:
+        _append_failure_details(out_md=paths.output_md, run_dir=run_dir)
+    return int(proc.returncode)
 
 
 if __name__ == "__main__":

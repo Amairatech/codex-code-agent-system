@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+ALLOWED_TASK_STATUSES = {"pending", "in_progress", "agent_done", "done", "deferred", "blocked"}
+
+
 def _utc_now_rfc3339() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -161,7 +164,7 @@ def cmd_proposal(args: argparse.Namespace) -> int:
     base = root / "openspec" / "changes" / change
     _mkdirp(base / "specs")
     if not (root / "openspec" / "project.md").exists():
-        raise SystemExit("Missing openspec/project.md. Run: python3 scripts/specflow.py init")
+        raise SystemExit("Missing openspec/project.md. Run: python3 .plan-code-scripts/specflow.py init")
     for name, content in (
         ("proposal.md", _default_proposal_md(change)),
         ("tasks.md", _default_tasks_md()),
@@ -190,6 +193,26 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_verify_overrides(path: Path | None) -> dict[str, object]:
+    if not path:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError:
+        return {}
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Invalid JSON in overrides file {path}: {e}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"Overrides file must be a JSON object: {path}")
+    return data
+
+
+def _apply_task_override(task: dict[str, object], override: dict[str, object]) -> None:
+    for key in ("verify", "expected_files", "done_criteria", "title", "description"):
+        if key in override:
+            task[key] = override[key]
+
+
 def _plan_goal_from_proposal(proposal_md: str, fallback: str) -> str:
     for line in proposal_md.splitlines():
         if line.startswith("# "):
@@ -208,7 +231,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     tasks_md_path = change_dir / "tasks.md"
     proposal_md_path = change_dir / "proposal.md"
     if not tasks_md_path.exists() or not proposal_md_path.exists():
-        raise SystemExit("Missing tasks/proposal. Run: python3 scripts/specflow.py proposal <change>")
+        raise SystemExit("Missing tasks/proposal. Run: python3 .plan-code-scripts/specflow.py proposal <change>")
 
     tasks = _parse_tasks_md(tasks_md_path.read_text(encoding="utf-8"))
     if not tasks:
@@ -221,6 +244,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
     plan_dir = root / ".plans" / pr
     _mkdirp(plan_dir)
+
+    overrides_path = Path(args.verify_overrides).expanduser().resolve() if args.verify_overrides else None
+    overrides = _load_verify_overrides(overrides_path)
+    default_verify = overrides.get("default_verify")
+    if default_verify is not None and not isinstance(default_verify, list):
+        raise SystemExit("verify_overrides.json: default_verify must be a list of strings")
 
     context_md = f"""# Architect Context Pack ({pr})
 
@@ -247,6 +276,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
     plan_tasks: list[dict[str, object]] = []
     for idx, t in enumerate(tasks, start=1):
         task_id = f"task_{idx:03d}"
+        verify = ["<fill: 1-3 concrete commands the planner will run>"]
+        if isinstance(default_verify, list) and all(isinstance(x, str) for x in default_verify) and default_verify:
+            verify = list(default_verify)
         plan_tasks.append(
             {
                 "id": task_id,
@@ -258,9 +290,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                     "Do not implement other tasks."
                 ),
                 "expected_files": [],
-                "verify": [
-                    "<fill: 1-3 concrete commands the planner will run>",
-                ],
+                "verify": verify,
                 "done_criteria": [
                     "Implementation matches the requirement implied by the task line.",
                     "Relevant tests/builds (if any) pass.",
@@ -269,6 +299,22 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 "status": "pending",
             }
         )
+
+    # Apply overrides by task id or exact title.
+    by_id = overrides.get("by_task_id")
+    if isinstance(by_id, dict):
+        for task in plan_tasks:
+            tid = str(task.get("id") or "")
+            ov = by_id.get(tid)
+            if isinstance(ov, dict):
+                _apply_task_override(task, ov)
+    by_title = overrides.get("by_title")
+    if isinstance(by_title, dict):
+        for task in plan_tasks:
+            title = str(task.get("title") or "")
+            ov = by_title.get(title)
+            if isinstance(ov, dict):
+                _apply_task_override(task, ov)
 
     payload: dict[str, object] = {
         "goal": goal,
@@ -317,6 +363,31 @@ def cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validate_plan(args: argparse.Namespace) -> int:
+    root = _repo_root(Path(args.repo))
+    pr = _slugify(args.pr)
+    plan_path = root / ".plans" / pr / "plan.json"
+    if not plan_path.exists():
+        raise SystemExit(f"Missing plan file: {plan_path}")
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise SystemExit(f"Invalid plan schema (missing tasks list): {plan_path}")
+    for i, t in enumerate(tasks, start=1):
+        if not isinstance(t, dict):
+            raise SystemExit(f"Invalid task at index {i}: expected object")
+        tid = str(t.get("id") or t.get("task_id") or "").strip()
+        if not tid:
+            raise SystemExit(f"Task at index {i} missing id/task_id")
+        status = str(t.get("status") or "pending")
+        if status not in ALLOWED_TASK_STATUSES:
+            raise SystemExit(f"Task {tid} has invalid status: {status!r} (allowed: {sorted(ALLOWED_TASK_STATUSES)})")
+        verify = t.get("verify")
+        if not isinstance(verify, list):
+            raise SystemExit(f"Task {tid} verify must be a list")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="OpenSpec-inspired spec/task scaffolding for Codex planner workflows.")
     parser.add_argument("--repo", default=".", help="Repo root (default: .)")
@@ -339,7 +410,16 @@ def main() -> int:
     p_plan.add_argument("change", help="Change name (slug).")
     p_plan.add_argument("--pr", default=None, help="PR name (defaults to change).")
     p_plan.add_argument("--force", action="store_true", help="Overwrite .plans/<PR> artifacts if they exist.")
+    p_plan.add_argument(
+        "--verify-overrides",
+        default=None,
+        help="Path to verify_overrides.json (supports default_verify, by_task_id, by_title).",
+    )
     p_plan.set_defaults(func=cmd_plan)
+
+    p_vp = sub.add_parser("validate-plan", help="Validate .plans/<PR>/plan.json schema/status values.")
+    p_vp.add_argument("--pr", required=True, help="PR name")
+    p_vp.set_defaults(func=cmd_validate_plan)
 
     p_arch = sub.add_parser("archive", help="Move an OpenSpec change folder into openspec/archive/ with a timestamp.")
     p_arch.add_argument("change", help="Change name (slug).")
