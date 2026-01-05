@@ -105,6 +105,7 @@ Copy `.plan-code-scripts/`:
 
 - `--sandbox danger-full-access --approval never` is intentionally high-trust. Only use it in environments you control.
 - Don’t include secrets in agent briefs or planning artifacts; assume run directories may contain logs.
+- If you run multiple planner sessions across projects, avoid `killall`/`pkill` (especially against `codex`). It can terminate every session at once. Prefer killing only specific PIDs you started.
 
 ## License
 

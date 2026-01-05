@@ -151,6 +151,7 @@ Repeat until all tasks are done:
 - Every task includes a small verification contract (1–3 concrete commands). Planner runs these before marking `done`.
 - Prefer a baseline commit if the repo has no git history (baseline snapshot on default branch, then feature work on `pr/<PR_NAME>`).
 - Use parallelism only across non-overlapping domains; otherwise run one task at a time.
+- Never run `killall`/`pkill` (especially against `codex`, `ghostty`, `Terminal`, or your shell). In YOLO mode this can kill every planner session across projects. If something hangs, kill only the exact PID you started, or stop via the orchestrator run’s `RUN_DIR` artifacts.
 
 ## Spawning Code Agents (Ghostty optional)
 

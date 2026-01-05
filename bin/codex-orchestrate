@@ -182,6 +182,7 @@ def _task_markdown(
 - Workspace root: `{code_dir}`
 - You have write access to `{code_dir}` and `{run_dir}`.
 - Orchestrator invocation run id: `{invocation_run_id}`
+- Safety: do **not** run `killall`/`pkill` or kill `codex`/terminal processes by name. If you must stop a subprocess you started, kill only that exact PID.
 """
 
 
@@ -559,6 +560,7 @@ def main() -> int:
         _mkdirp(logs_dir)
 
     stop_file = control_dir / "stop"
+    agent_pids_path = control_dir / "agent_pids.json"
 
     plan_goal, tasks, plan_payload = _load_plan_file(plan_file, goal)
     # Snapshot the plan into the run for auditability/debugging (default off in compact mode).
@@ -678,11 +680,26 @@ def main() -> int:
                 # Interactive sessions require a TTY; always stream output.
                 proc = subprocess.run(codex_cmd, check=False)
             elif args.stream_agent_output:
-                proc = subprocess.run(codex_cmd, check=False)
+                # When streaming, avoid attaching stdin so agents can't put the planner TTY into a weird state.
+                proc = subprocess.run(codex_cmd, check=False, stdin=subprocess.DEVNULL)
             else:
                 log_path = run_dir / f"agent_{task.task_id}.log"
+                # Fully detach the agent from the planner's TTY/session so a crash/kill doesn't
+                # corrupt the planner terminal or take other Codex sessions down with it.
+                env = dict(os.environ)
+                env["TERM"] = "dumb"
                 with log_path.open("ab") as log_fp:
-                    proc = subprocess.run(codex_cmd, check=False, stdout=log_fp, stderr=subprocess.STDOUT)
+                    popen = subprocess.Popen(
+                        codex_cmd,
+                        stdout=log_fp,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        start_new_session=True,
+                        env=env,
+                    )
+                    _write_json(agent_pids_path, {task.task_id: popen.pid})
+                    rc = popen.wait()
+                    proc = subprocess.CompletedProcess(codex_cmd, rc)
             if proc.returncode != 0:
                 print(f"Task {task.task_id} failed to launch (exit={proc.returncode}).")
                 print("Hint: verify your Codex CLI version supports the flags in use.")
