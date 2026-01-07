@@ -128,7 +128,18 @@ def _ghostty_open_command(args: list[str]) -> list[str]:
         return ["ghostty", *args]
     # On macOS, Ghostty expects an explicit action (e.g. `+new-window`).
     # `open -na Ghostty.app --args` is the supported way to pass args.
-    return ["open", "-na", "Ghostty.app", "--args", "+new-window", *args]
+    # Some Ghostty configs (notably `quit-after-last-window-closed=true`) can cause
+    # the entire app to exit when a spawned `-e` command finishes, which can close
+    # unrelated planner windows. Force this off for orchestrated agent windows.
+    return [
+        "open",
+        "-na",
+        "Ghostty.app",
+        "--args",
+        "+new-window",
+        "--quit-after-last-window-closed=false",
+        *args,
+    ]
 
 
 def _generate_default_plan(goal: str) -> list[Task]:
