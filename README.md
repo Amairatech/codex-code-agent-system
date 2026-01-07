@@ -106,6 +106,12 @@ If your plan drifted (results exist in run folders but plan.json didn’t update
 python3 .plan-code-scripts/sync_plan.py --repo . --pr "<PR_NAME>" --run-root "${CODEX_HOME:-$HOME/.codex}/runs"
 ```
 
+### Run metadata (debugging)
+
+Each orchestrator run writes:
+- `RUN_DIR/meta.json` (status + timestamps + task/log pointers)
+- `RUN_DIR/control/heartbeat.json` (updated periodically while waiting for results)
+
 ## What to copy into your repo
 
 Copy `.plan-code-scripts/`:

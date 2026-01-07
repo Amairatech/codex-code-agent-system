@@ -53,6 +53,25 @@ def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _read_json_or_empty(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _update_json(path: Path, updates: dict[str, Any]) -> None:
+    current = _read_json_or_empty(path)
+    current.update(updates)
+    _write_json(path, current)
+
+
+def _prompt_preview(text: str, *, max_len: int = 120) -> str:
+    t = " ".join(text.split())
+    return (t[: max_len - 1] + "…") if len(t) > max_len else t
+
+
 def _tail_text(path: Path, *, max_lines: int = 200, max_bytes: int = 128_000) -> str:
     try:
         data = path.read_bytes()
@@ -479,12 +498,27 @@ def _wait_for_task_completion(
     results_file: Path,
     done_file: Path,
     stop_file: Path,
+    heartbeat_file: Path | None = None,
+    heartbeat_interval_seconds: float = 30.0,
 ) -> bool:
     if handshake == "done-file":
         return _wait_for_done(done_file, stop_file)
+    last_hb = 0.0
     while True:
         if stop_file.exists():
             return False
+        now = time.time()
+        if heartbeat_file and heartbeat_interval_seconds > 0 and (now - last_hb) >= heartbeat_interval_seconds:
+            last_hb = now
+            _update_json(
+                heartbeat_file,
+                {
+                    "updated_at": _utc_now_rfc3339(),
+                    "task_id": expected_task_id,
+                    "run_id": expected_run_id,
+                    "waiting_for": str(results_file),
+                },
+            )
         if results_file.exists() and _task_json_is_done(
             results_file, expected_task_id=expected_task_id, expected_run_id=expected_run_id
         ):
@@ -573,6 +607,12 @@ def main() -> int:
         help="Grace period before SIGKILL when timing out an agent process group.",
     )
     parser.add_argument(
+        "--heartbeat-interval-seconds",
+        type=float,
+        default=float(cfg.get("heartbeat_interval_seconds", 30.0) or 30.0),
+        help="How often to update a heartbeat file while waiting for results (0 disables).",
+    )
+    parser.add_argument(
         "--sandbox",
         default="workspace-write",
         choices=["read-only", "workspace-write", "danger-full-access"],
@@ -645,6 +685,8 @@ def main() -> int:
 
     stop_file = control_dir / "stop"
     agent_pids_path = control_dir / "agent_pids.json"
+    heartbeat_path = control_dir / "heartbeat.json"
+    meta_path = run_dir / "meta.json"
 
     plan_goal, tasks, plan_payload = _load_plan_file(plan_file, goal)
     # Snapshot the plan into the run for auditability/debugging (default off in compact mode).
@@ -656,8 +698,15 @@ def main() -> int:
             {**plan_payload, "plan_dir": str(plan_dir), "code_dir": str(code_dir), "run_dir": str(run_dir)},
         )
     _write_json(
-        run_dir / "meta.json",
-        {"run_dir": str(run_dir), "invocation_run_id": invocation_run_id, "args": vars(args), "created_at": _utc_now_rfc3339()},
+        meta_path,
+        {
+            "run_dir": str(run_dir),
+            "invocation_run_id": invocation_run_id,
+            "created_at": _utc_now_rfc3339(),
+            "status": "running",
+            "prompt_preview": _prompt_preview(plan_goal),
+            "args": vars(args),
+        },
     )
 
     print(f"RUN_DIR={run_dir}")
@@ -729,6 +778,19 @@ def main() -> int:
 
         done_file = done_dir / f"{task.task_id}.done"
         results_file = results_dir / f"{task.task_id}.json"
+        log_path = run_dir / f"agent_{task.task_id}.log"
+
+        _update_json(
+            meta_path,
+            {
+                "updated_at": _utc_now_rfc3339(),
+                "status": "task_preparing",
+                "current_task_id": task.task_id,
+                "current_task_title": task.title,
+                "results_path": str(results_file),
+                "agent_log_path": str(log_path),
+            },
+        )
 
         # If we reuse a run directory, move aside stale completion artifacts so
         # the orchestrator can't immediately "complete" without an agent run.
@@ -745,29 +807,45 @@ def main() -> int:
             except OSError:
                 pass
 
-        codex_base = [
-            *_codex_command(
-                interactive=args.interactive_code,
-                sandbox=args.sandbox,
-                approval=args.approval,
-                code_dir=code_dir,
-                run_dir=run_dir,
-                prompt=_codex_prompt_for_task(task, run_dir, handshake=handshake, invocation_run_id=invocation_run_id),
-            )
-        ]
-        codex_cmd = codex_base
+        codex_cmd, codex_stdin = _codex_command(
+            interactive=args.interactive_code,
+            sandbox=args.sandbox,
+            approval=args.approval,
+            code_dir=code_dir,
+            run_dir=run_dir,
+            prompt=_codex_prompt_for_task(task, run_dir, handshake=handshake, invocation_run_id=invocation_run_id),
+        )
 
         if args.ghostty:
-            _launch_task_in_ghostty(task_id=task.task_id, command=codex_cmd, run_dir=run_dir, keep_open=args.keep_open)
+            # Ghostty launcher is shell-based; feed the prompt from a file to avoid arg/quoting issues.
+            prompt_path = tasks_dir / f"{task.task_id}.prompt.txt"
+            _write_text(prompt_path, codex_stdin or "")
+            # Replace trailing "-" with stdin file piping if using stdin prompts.
+            if codex_cmd and codex_cmd[-1] == "-" and codex_stdin is not None:
+                cmd_str = _sh_join(codex_cmd)
+                wrapped = ["/bin/zsh", "-lc", f"cat {shlex.quote(str(prompt_path))} | {cmd_str}"]
+                _launch_task_in_ghostty(task_id=task.task_id, command=wrapped, run_dir=run_dir, keep_open=args.keep_open)
+            else:
+                _launch_task_in_ghostty(task_id=task.task_id, command=codex_cmd, run_dir=run_dir, keep_open=args.keep_open)
         else:
+            if args.no_wait and args.interactive_code:
+                print("error: --no-wait is not supported with --interactive-code")
+                return 2
+            if args.no_wait and args.stream_agent_output:
+                print("warning: --no-wait ignores --stream-agent-output; capturing output to a log file instead.")
             if args.interactive_code:
                 # Interactive sessions require a TTY; always stream output.
                 proc = subprocess.run(codex_cmd, check=False)
-            elif args.stream_agent_output:
+            elif args.stream_agent_output and not args.no_wait:
                 # When streaming, avoid attaching stdin so agents can't put the planner TTY into a weird state.
-                proc = subprocess.run(codex_cmd, check=False, stdin=subprocess.DEVNULL)
+                proc = subprocess.run(
+                    codex_cmd,
+                    check=False,
+                    input=codex_stdin,
+                    text=True,
+                    timeout=(None if args.timeout_minutes <= 0 else args.timeout_minutes * 60.0),
+                )
             else:
-                log_path = run_dir / f"agent_{task.task_id}.log"
                 # Fully detach the agent from the planner's TTY/session so a crash/kill doesn't
                 # corrupt the planner terminal or take other Codex sessions down with it.
                 env = dict(os.environ)
@@ -777,18 +855,93 @@ def main() -> int:
                         codex_cmd,
                         stdout=log_fp,
                         stderr=subprocess.STDOUT,
-                        stdin=subprocess.DEVNULL,
+                        stdin=subprocess.PIPE if codex_stdin is not None else subprocess.DEVNULL,
                         start_new_session=True,
                         env=env,
                     )
                     _write_json(agent_pids_path, {task.task_id: popen.pid})
-                    rc = popen.wait()
-                    proc = subprocess.CompletedProcess(codex_cmd, rc)
+                    _update_json(
+                        meta_path,
+                        {
+                            "updated_at": _utc_now_rfc3339(),
+                            "status": "agent_running",
+                            "agent_pid": popen.pid,
+                        },
+                    )
+                    if args.no_wait:
+                        if codex_stdin is not None:
+                            try:
+                                popen.stdin.write(codex_stdin.encode("utf-8", errors="replace"))
+                                popen.stdin.close()
+                            except Exception:
+                                pass
+                        print(f"Spawned agent PID={popen.pid} (no-wait).")
+                        print(f"Agent output captured at: {log_path}")
+                        _update_json(
+                            meta_path,
+                            {
+                                "updated_at": _utc_now_rfc3339(),
+                                "status": "running_background",
+                                "no_wait": True,
+                            },
+                        )
+                        ran += 1
+                        continue
+                    try:
+                        if codex_stdin is not None:
+                            popen.stdin.write(codex_stdin.encode("utf-8", errors="replace"))
+                            popen.stdin.close()
+                        timeout = None if args.timeout_minutes <= 0 else args.timeout_minutes * 60.0
+                        rc = popen.wait(timeout=timeout)
+                        proc = subprocess.CompletedProcess(codex_cmd, rc)
+                    except subprocess.TimeoutExpired:
+                        _terminate_process_group(popen.pid, grace_seconds=float(args.timeout_grace_seconds))
+                        _write_fallback_results(
+                            results_path=results_file,
+                            task_id=task.task_id,
+                            run_id=invocation_run_id,
+                            status="partial",
+                            note="Agent timed out; process group terminated.",
+                            exit_code=None,
+                            log_path=log_path,
+                        )
+                        # Mark as blocked; planner can retry with a smaller task or longer timeout.
+                        for raw in plan_payload.get("tasks", []):
+                            if (raw.get("id") or raw.get("task_id")) == task.task_id:
+                                raw["status"] = "blocked"
+                                raw["blocked_reason"] = "timeout"
+                                raw["blocked_at"] = _utc_now_rfc3339()
+                                plan_payload_updated = True
+                                break
+                        if plan_payload_updated:
+                            _write_json(plan_file, plan_payload)
+                        print(f"Task {task.task_id} timed out; wrote fallback results to: {results_file}")
+                        _update_json(
+                            meta_path,
+                            {
+                                "updated_at": _utc_now_rfc3339(),
+                                "status": "timeout",
+                                "exit_code": 124,
+                            },
+                        )
+                        return 124
             if proc.returncode != 0:
                 print(f"Task {task.task_id} failed to launch (exit={proc.returncode}).")
                 print("Hint: verify your Codex CLI version supports the flags in use.")
                 if not args.stream_agent_output and not args.interactive_code:
                     print(f"Agent output captured at: {run_dir / f'agent_{task.task_id}.log'}")
+                    # Ensure the planner has a results file to inspect.
+                    log_path = run_dir / f"agent_{task.task_id}.log"
+                    if handshake == "results-json" and not results_file.exists():
+                        _write_fallback_results(
+                            results_path=results_file,
+                            task_id=task.task_id,
+                            run_id=invocation_run_id,
+                            status="partial",
+                            note=f"Agent exited with code {proc.returncode} before writing results.",
+                            exit_code=proc.returncode,
+                            log_path=log_path if log_path.exists() else None,
+                        )
                 return proc.returncode
 
         ran += 1
@@ -797,6 +950,13 @@ def main() -> int:
 
         wait_target = results_file if handshake == "results-json" else done_file
         print(f"Waiting for {wait_target} ...")
+        _update_json(
+            meta_path,
+            {
+                "updated_at": _utc_now_rfc3339(),
+                "status": "waiting_for_results",
+            },
+        )
         if not _wait_for_task_completion(
             handshake=handshake,
             expected_task_id=task.task_id,
@@ -804,22 +964,62 @@ def main() -> int:
             results_file=results_file,
             done_file=done_file,
             stop_file=stop_file,
+            heartbeat_file=heartbeat_path,
+            heartbeat_interval_seconds=float(args.heartbeat_interval_seconds),
         ):
             print("Stopped while waiting for task completion.")
+            _update_json(
+                meta_path,
+                {
+                    "updated_at": _utc_now_rfc3339(),
+                    "status": "stopped",
+                    "exit_code": 2,
+                },
+            )
             return 2
 
         # Mark agent completion (planner still decides when it's "done" after verification).
+        result_status = ""
+        try:
+            if results_file.exists():
+                result_status = str(json.loads(results_file.read_text(encoding="utf-8")).get("status") or "").lower()
+        except Exception:
+            result_status = ""
         for raw in plan_payload.get("tasks", []):
             if (raw.get("id") or raw.get("task_id")) == task.task_id:
-                if raw.get("status") == "delegated":
-                    raw["status"] = "agent_done"
-                    raw["agent_done_at"] = _utc_now_rfc3339()
+                if result_status in ("partial", "timeout", "failed"):
+                    raw["status"] = "blocked"
+                    raw["blocked_reason"] = "agent_reported_partial"
+                    raw["blocked_at"] = _utc_now_rfc3339()
                     plan_payload_updated = True
+                else:
+                    if raw.get("status") in ("in_progress", "delegated"):
+                        raw["status"] = "agent_done"
+                        raw["agent_done_at"] = _utc_now_rfc3339()
+                        plan_payload_updated = True
                 break
 
     if plan_payload_updated:
         _write_json(plan_file, plan_payload)
 
+    if args.no_wait:
+        _update_json(
+            meta_path,
+            {
+                "updated_at": _utc_now_rfc3339(),
+                "status": "running_background",
+                "exit_code": 0,
+            },
+        )
+    else:
+        _update_json(
+            meta_path,
+            {
+                "updated_at": _utc_now_rfc3339(),
+                "status": "completed",
+                "exit_code": 0,
+            },
+        )
     return 0
 
 
