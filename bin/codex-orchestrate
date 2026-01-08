@@ -72,6 +72,23 @@ def _prompt_preview(text: str, *, max_len: int = 120) -> str:
     return (t[: max_len - 1] + "…") if len(t) > max_len else t
 
 
+def _extract_thread_id_from_log(path: Path) -> str | None:
+    try:
+        with path.open("rb") as fp:
+            for raw in fp:
+                if not raw.startswith(b"{"):
+                    continue
+                try:
+                    obj = json.loads(raw.decode("utf-8", errors="replace"))
+                except Exception:
+                    continue
+                if obj.get("type") == "thread.started" and isinstance(obj.get("thread_id"), str):
+                    return str(obj["thread_id"])
+    except OSError:
+        return None
+    return None
+
+
 def _parse_rfc3339(s: str) -> datetime | None:
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -390,7 +407,9 @@ def _codex_command(
     code_dir: Path,
     run_dir: Path,
     prompt: str,
-) -> list[str]:
+    json_events: bool,
+    output_last_message: Path | None,
+) -> tuple[list[str], str | None]:
     if interactive:
         # For interactive runs, Codex CLI accepts these flags at top-level.
         return (
@@ -419,6 +438,10 @@ def _codex_command(
         str(run_dir),
         "--skip-git-repo-check",
     ]
+    if json_events:
+        cmd.append("--json")
+    if output_last_message:
+        cmd += ["--output-last-message", str(output_last_message)]
 
     # Codex CLI `exec` doesn't support the full approval matrix; `--full-auto`
     # is the supported way to request sandboxed auto-execution.
@@ -930,6 +953,8 @@ def main() -> int:
             except OSError:
                 pass
 
+        last_message_path = run_dir / f"last_message_{task.task_id}.txt"
+        json_events = not bool(args.stream_agent_output) and not bool(args.interactive_code)
         codex_cmd, codex_stdin = _codex_command(
             interactive=args.interactive_code,
             sandbox=args.sandbox,
@@ -937,6 +962,8 @@ def main() -> int:
             code_dir=code_dir,
             run_dir=run_dir,
             prompt=_codex_prompt_for_task(task, run_dir, handshake=handshake, invocation_run_id=invocation_run_id),
+            json_events=json_events,
+            output_last_message=last_message_path,
         )
 
         if args.ghostty:
@@ -1019,6 +1046,9 @@ def main() -> int:
                         proc = subprocess.CompletedProcess(codex_cmd, rc)
                     except subprocess.TimeoutExpired:
                         _terminate_process_group(popen.pid, grace_seconds=float(args.timeout_grace_seconds))
+                        thread_id = _extract_thread_id_from_log(log_path)
+                        if thread_id:
+                            _update_json(meta_path, {"thread_id": thread_id})
                         _write_fallback_results(
                             results_path=results_file,
                             task_id=task.task_id,
@@ -1055,6 +1085,9 @@ def main() -> int:
                     print(f"Agent output captured at: {run_dir / f'agent_{task.task_id}.log'}")
                     # Ensure the planner has a results file to inspect.
                     log_path = run_dir / f"agent_{task.task_id}.log"
+                    thread_id = _extract_thread_id_from_log(log_path)
+                    if thread_id:
+                        _update_json(meta_path, {"thread_id": thread_id})
                     if handshake == "results-json" and not results_file.exists():
                         _write_fallback_results(
                             results_path=results_file,
@@ -1100,6 +1133,12 @@ def main() -> int:
                 },
             )
             return 2
+
+        # Capture thread id from the jsonl log (for `codex exec resume`).
+        if json_events and log_path.exists():
+            thread_id = _extract_thread_id_from_log(log_path)
+            if thread_id:
+                _update_json(meta_path, {"thread_id": thread_id})
 
         # Mark agent completion (planner still decides when it's "done" after verification).
         result_status = ""

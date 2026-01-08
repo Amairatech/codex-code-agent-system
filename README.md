@@ -120,6 +120,8 @@ Show the latest run’s PID + log tail, and print a rerun command:
 python3 .plan-code-scripts/task_doctor.py --repo . --pr "<PR_NAME>" --print-rerun
 ```
 
+If the run log includes a `thread_id` (Codex 0.79+), `task_doctor` also prints a `codex exec resume <thread_id>` command so you can ask the same agent session to finish the handshake instead of killing/re-running.
+
 ## What to copy into your repo
 
 Copy `.plan-code-scripts/`:

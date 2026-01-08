@@ -51,6 +51,23 @@ def _tail(path: Path, *, max_lines: int = 80, max_bytes: int = 64_000) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+def _extract_thread_id_from_log(path: Path) -> str | None:
+    try:
+        with path.open("rb") as fp:
+            for raw in fp:
+                if not raw.startswith(b"{"):
+                    continue
+                try:
+                    obj = json.loads(raw.decode("utf-8", errors="replace"))
+                except Exception:
+                    continue
+                if obj.get("type") == "thread.started" and isinstance(obj.get("thread_id"), str):
+                    return str(obj["thread_id"])
+    except OSError:
+        return None
+    return None
+
+
 def _latest_run_dir(runs_root: Path) -> Path | None:
     if not runs_root.exists():
         return None
@@ -160,6 +177,16 @@ def main() -> int:
     else:
         print("log: (missing)")
 
+    thread_id = None
+    if isinstance(meta.get("thread_id"), str):
+        thread_id = str(meta["thread_id"])
+    elif log_file and log_file.exists():
+        thread_id = _extract_thread_id_from_log(log_file)
+    if thread_id:
+        print(f"thread_id: {thread_id}")
+    else:
+        print("thread_id: (missing)")
+
     if args.kill:
         if pid is None:
             print("No PID available to kill.")
@@ -179,10 +206,17 @@ def main() -> int:
         )
         print("\nrerun_command:")
         print(cmd)
+        if thread_id:
+            print("\nresume_command:")
+            print(f"codex exec resume {thread_id} -")
+            print("resume_prompt:")
+            task_file = run_dir / "tasks" / f"{task_id}.md"
+            results_path = run_dir / "results" / f"{task_id}.json"
+            print(f"- Read: {task_file}")
+            print(f"- Then ensure you write: {results_path} (include task_id + run_id if required by the task brief)")
 
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
