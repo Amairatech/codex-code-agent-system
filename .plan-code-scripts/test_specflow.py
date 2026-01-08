@@ -79,6 +79,18 @@ class SpecflowTests(unittest.TestCase):
             payload = json.loads((repo / ".plans" / "p" / "plan.json").read_text(encoding="utf-8"))
             self.assertEqual(payload["tasks"][0]["verify"], ["echo t1"])
 
+    def test_plan_suggests_verify_from_package_json(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self.assertEqual(run_specflow("init", repo=repo).returncode, 0)
+            self.assertEqual(run_specflow("proposal", "x", repo=repo).returncode, 0)
+            (repo / "package.json").write_text(json.dumps({"scripts": {"test": "echo ok"}}), encoding="utf-8")
+
+            res = run_specflow("plan", "x", "--pr", "p", repo=repo)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            payload = json.loads((repo / ".plans" / "p" / "plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["tasks"][0]["verify"], ["npm test"])
+
     def test_plan_refuses_overwrite_without_force(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)

@@ -220,6 +220,70 @@ def _plan_goal_from_proposal(proposal_md: str, fallback: str) -> str:
     return fallback
 
 
+def _detect_package_manager(root: Path) -> str:
+    if (root / "pnpm-lock.yaml").exists():
+        return "pnpm"
+    if (root / "yarn.lock").exists():
+        return "yarn"
+    return "npm"
+
+
+def _read_package_scripts(root: Path) -> dict[str, str]:
+    pkg = root / "package.json"
+    if not pkg.exists():
+        return {}
+    try:
+        data = json.loads(pkg.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    scripts = data.get("scripts")
+    if not isinstance(scripts, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in scripts.items():
+        if isinstance(k, str) and isinstance(v, str):
+            out[k] = v
+    return out
+
+
+def _find_single_xcodeproj(root: Path, *, max_depth: int = 2) -> Path | None:
+    # Keep cheap and deterministic: only search a couple levels.
+    candidates: list[Path] = []
+    for p in root.rglob("*.xcodeproj"):
+        try:
+            rel = p.relative_to(root)
+        except Exception:
+            continue
+        if len(rel.parts) - 1 > max_depth:
+            continue
+        candidates.append(p)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _suggest_verify_commands(root: Path) -> list[str] | None:
+    cmds: list[str] = []
+
+    xcodeproj = _find_single_xcodeproj(root)
+    if xcodeproj is not None:
+        cmds.append(f"xcodebuild -list -project {xcodeproj.relative_to(root)}")
+
+    scripts = _read_package_scripts(root)
+    if scripts:
+        pm = _detect_package_manager(root)
+        if "typecheck" in scripts:
+            cmds.append(f"{pm} -s typecheck" if pm != "npm" else "npm run -s typecheck")
+        elif "test" in scripts:
+            cmds.append(f"{pm} -s test" if pm != "npm" else "npm test")
+
+    # Keep it to 1-3 commands.
+    cmds = [c for c in cmds if c.strip()]
+    if not cmds:
+        return None
+    return cmds[:3]
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     root = _repo_root(Path(args.repo))
     change = _slugify(args.change)
@@ -250,6 +314,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     default_verify = overrides.get("default_verify")
     if default_verify is not None and not isinstance(default_verify, list):
         raise SystemExit("verify_overrides.json: default_verify must be a list of strings")
+    auto_verify = _suggest_verify_commands(root)
 
     context_md = f"""# Architect Context Pack ({pr})
 
@@ -279,6 +344,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
         verify = ["<fill: 1-3 concrete commands the planner will run>"]
         if isinstance(default_verify, list) and all(isinstance(x, str) for x in default_verify) and default_verify:
             verify = list(default_verify)
+        elif auto_verify:
+            verify = list(auto_verify)
         plan_tasks.append(
             {
                 "id": task_id,

@@ -112,6 +112,14 @@ Each orchestrator run writes:
 - `RUN_DIR/meta.json` (status + timestamps + task/log pointers)
 - `RUN_DIR/control/heartbeat.json` (updated periodically while waiting for results)
 
+### Stuck task helper (optional)
+
+Show the latest run’s PID + log tail, and print a rerun command:
+
+```bash
+python3 .plan-code-scripts/task_doctor.py --repo . --pr "<PR_NAME>" --print-rerun
+```
+
 ## What to copy into your repo
 
 Copy `.plan-code-scripts/`:

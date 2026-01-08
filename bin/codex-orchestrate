@@ -72,6 +72,101 @@ def _prompt_preview(text: str, *, max_len: int = 120) -> str:
     return (t[: max_len - 1] + "…") if len(t) > max_len else t
 
 
+def _parse_rfc3339(s: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _sync_plan_from_runs(*, plan_file: Path, runs_root: Path) -> bool:
+    """
+    Best-effort plan drift repair:
+    - If agent produced results JSON but orchestrator/planner didn't update plan.json,
+      update task status to agent_done (or blocked for partial/timeout/failed).
+    - Never marks tasks as done (planner verification remains the source of truth).
+    """
+    payload = _read_json_or_empty(plan_file)
+    raw_tasks = payload.get("tasks")
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        return False
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for t in raw_tasks:
+        if isinstance(t, dict):
+            tid = str(t.get("id") or t.get("task_id") or "").strip()
+            if tid:
+                by_id[tid] = t
+
+    latest: dict[str, dict[str, Any]] = {}
+    if not runs_root.exists():
+        return False
+
+    for run_dir in sorted([p for p in runs_root.glob("*") if p.is_dir()]):
+        created_at = datetime.fromtimestamp(run_dir.stat().st_mtime, tz=timezone.utc)
+        meta = _read_json_or_empty(run_dir / "meta.json")
+        if "created_at" in meta:
+            dt = _parse_rfc3339(str(meta.get("created_at") or ""))
+            if dt:
+                created_at = dt
+        run_id = str(meta.get("invocation_run_id") or "")
+
+        res_dir = run_dir / "results"
+        if not res_dir.exists():
+            continue
+        for res_file in res_dir.glob("task_*.json"):
+            rp = _read_json_or_empty(res_file)
+            task_id = str(rp.get("task_id") or rp.get("task") or rp.get("id") or "").strip()
+            if not task_id:
+                continue
+            entry = {
+                "task_id": task_id,
+                "status": str(rp.get("status") or rp.get("state") or "").strip().lower() or "completed",
+                "run_dir": str(run_dir),
+                "created_at": created_at.isoformat(timespec="seconds"),
+                "run_id": run_id,
+            }
+            prev = latest.get(task_id)
+            if not prev:
+                latest[task_id] = entry
+            else:
+                prev_dt = _parse_rfc3339(str(prev.get("created_at") or "")) or created_at
+                if created_at >= prev_dt:
+                    latest[task_id] = entry
+
+    changed = False
+    now = _utc_now_rfc3339()
+    for task_id, rr in latest.items():
+        t = by_id.get(task_id)
+        if not t:
+            continue
+        current = str(t.get("status") or "pending")
+        if current in ("done", "deferred"):
+            continue
+        t["run_dir"] = rr["run_dir"]
+        t.setdefault("delegated_at", rr["created_at"])
+        t["last_run_id"] = rr.get("run_id") or ""
+        s = str(rr.get("status") or "").lower()
+        if s in ("partial", "timeout", "failed", "error"):
+            if current != "blocked":
+                t["status"] = "blocked"
+                t["blocked_reason"] = s
+                t["blocked_at"] = now
+                changed = True
+        else:
+            if current in ("pending", "in_progress"):
+                t["status"] = "agent_done"
+                t["agent_done_at"] = now
+                changed = True
+
+    if changed:
+        tmeta = payload.setdefault("orchestrator", {})
+        if isinstance(tmeta, dict):
+            tmeta["last_sync_at"] = now
+        _write_json(plan_file, payload)
+    return changed
+
+
 def _tail_text(path: Path, *, max_lines: int = 200, max_bytes: int = 128_000) -> str:
     try:
         data = path.read_bytes()
@@ -624,6 +719,12 @@ def main() -> int:
         help="How often to update a heartbeat file while waiting for results (0 disables).",
     )
     parser.add_argument(
+        "--sync-plan",
+        action=argparse.BooleanOptionalAction,
+        default=bool(cfg.get("sync_plan", True)),
+        help="Repair plan.json drift from existing results JSON in run artifacts (default: true).",
+    )
+    parser.add_argument(
         "--sandbox",
         default="workspace-write",
         choices=["read-only", "workspace-write", "danger-full-access"],
@@ -700,6 +801,17 @@ def main() -> int:
     meta_path = run_dir / "meta.json"
 
     plan_goal, tasks, plan_payload = _load_plan_file(plan_file, goal)
+
+    # Best-effort drift repair: if a prior run produced results but plan.json didn't update,
+    # sync it now so we don't re-run completed tasks.
+    if args.sync_plan:
+        if args.run_root:
+            runs_root = Path(str(args.run_root)).expanduser().resolve() / pr_name
+        else:
+            runs_root = plan_dir / "runs"
+        _sync_plan_from_runs(plan_file=plan_file, runs_root=runs_root)
+        # Reload plan after sync (if it changed).
+        plan_goal, tasks, plan_payload = _load_plan_file(plan_file, goal)
     # Snapshot the plan into the run for auditability/debugging (default off in compact mode).
     if not args.compact_run:
         run_plan_path = run_dir / "plan" / "plan.json"
