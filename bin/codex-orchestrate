@@ -955,6 +955,14 @@ def main() -> int:
 
         last_message_path = run_dir / f"last_message_{task.task_id}.txt"
         json_events = not bool(args.stream_agent_output) and not bool(args.interactive_code)
+        _update_json(
+            meta_path,
+            {
+                "updated_at": _utc_now_rfc3339(),
+                "json_events": bool(json_events),
+                "last_message_path": str(last_message_path),
+            },
+        )
         codex_cmd, codex_stdin = _codex_command(
             interactive=args.interactive_code,
             sandbox=args.sandbox,
